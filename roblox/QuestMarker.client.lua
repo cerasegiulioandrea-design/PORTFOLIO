@@ -3,6 +3,8 @@
 
 	Indicatore dell'obiettivo corrente. Legge l'attributo replicato
 	"StoryStage" e accende un faro luminoso sul bersaglio giusto.
+	Scheda, freccia e cartello in pixel art come la squadra a schermo
+	(PartyHUD), col kit Pix.
 
 	PER AGGIUNGERE UNA TAPPA: una riga in OBJECTIVES.
 	  target = nome esatto del Model o della BasePart nel Workspace
@@ -13,7 +15,7 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
 local Workspace         = game:GetService("Workspace")
-local TweenService      = game:GetService("TweenService")
+local TextService       = game:GetService("TextService")
 
 local player = Players.LocalPlayer
 
@@ -46,6 +48,457 @@ local BEAM_HEIGHT = 300
 local RETRY_TIME  = 1.5
 local OBJ_POS = UDim2.new(0, 20, 0, 64)
 
+-- Misure dei pezzi 2D in pixel a 1080p (il cartello in pixel "di progetto":
+-- uno UIScale lo adatta al billboard, che cambia grandezza con la distanza)
+local CARD_W, CARD_H = 420, 72     -- scheda dell'obiettivo
+local SIGN_W, SIGN_H = 270, 102    -- cartello: stesse proporzioni del billboard (9 x 3.4)
+
+-- ============================================================================
+-- KIT PIXEL ART (lo stesso della squadra a schermo, PartyHUD)
+-- Riquadri bordeaux con bordo scuro e angoli "mangiati" di un pixel, luce in
+-- alto a sinistra e ombra in basso a destra, testo Arcade con l'ombra a
+-- pixel, oro per la selezione. Solo Frame: niente UICorner/UIStroke.
+-- Dentro Pix.canvas() gli offset sono "pixel a 1080p" e scalano con lo
+-- schermo; le misure in scale restano frazioni dello schermo come sempre.
+-- La ScreenGui deve avere ZIndexBehavior = Sibling.
+-- ============================================================================
+
+local Pix = {}
+do
+	local TweenService = game:GetService("TweenService")
+
+	Pix.P      = 3                  -- un "pixel" della pixel art (pixel a 1080p)
+	Pix.SHADOW = 2                  -- spostamento dell'ombra del testo
+	Pix.FONT   = Enum.Font.Arcade
+	Pix.SYMBOL = Enum.Font.GothamBlack  -- solo per simboli che Arcade non ha (₽ ★ ♂ ♀)
+
+	local C = {
+		ink         = Color3.fromRGB(26, 12, 16),
+		body        = Color3.fromRGB(78, 38, 46),
+		bodyLight   = Color3.fromRGB(112, 60, 70),
+		bodyShade   = Color3.fromRGB(54, 24, 31),
+		slot        = Color3.fromRGB(46, 20, 27),    -- riquadri incavati
+		slotLight   = Color3.fromRGB(92, 50, 58),
+		slotShade   = Color3.fromRGB(30, 12, 17),
+		hover       = Color3.fromRGB(96, 48, 58),    -- riga sotto il mouse
+		track       = Color3.fromRGB(36, 16, 21),
+		text        = Color3.fromRGB(246, 240, 230),
+		textDim     = Color3.fromRGB(196, 172, 176),
+		textShadow  = Color3.fromRGB(28, 10, 14),
+		white       = Color3.new(1, 1, 1),
+		gold        = Color3.fromRGB(255, 198, 64),
+		goldLight   = Color3.fromRGB(255, 230, 140),
+		goldShade   = Color3.fromRGB(196, 132, 28),
+		goldText    = Color3.fromRGB(62, 34, 6),
+		green       = Color3.fromRGB(72, 190, 96),
+		greenLight  = Color3.fromRGB(128, 226, 140),
+		greenShade  = Color3.fromRGB(40, 128, 62),
+		red         = Color3.fromRGB(214, 64, 58),
+		redLight    = Color3.fromRGB(246, 120, 108),
+		redShade    = Color3.fromRGB(146, 36, 36),
+		blue        = Color3.fromRGB(64, 128, 220),
+		blueLight   = Color3.fromRGB(122, 176, 248),
+		blueShade   = Color3.fromRGB(38, 80, 156),
+		purple      = Color3.fromRGB(136, 84, 200),
+		purpleLight = Color3.fromRGB(184, 140, 236),
+		purpleShade = Color3.fromRGB(88, 50, 140),
+		off         = Color3.fromRGB(96, 84, 88),
+		offLight    = Color3.fromRGB(124, 112, 116),
+		offShade    = Color3.fromRGB(70, 60, 64),
+		hpGreen     = Color3.fromRGB(72, 220, 96),
+		hpYellow    = Color3.fromRGB(240, 196, 48),
+		hpRed       = Color3.fromRGB(232, 76, 66),
+		ballRed     = Color3.fromRGB(232, 56, 52),
+		ballBottom  = Color3.fromRGB(214, 214, 222),
+	}
+	Pix.C = C
+
+	-- { riempimento, luce, ombra }: rilievo; "slot" ha luce e ombra scambiate (incavato)
+	Pix.STYLE = {
+		panel  = { C.body,   C.bodyLight,   C.bodyShade },
+		slot   = { C.slot,   C.slotShade,   C.slotLight },
+		hover  = { C.hover,  C.bodyLight,   C.bodyShade },
+		track  = { C.track },
+		gold   = { C.gold,   C.goldLight,   C.goldShade },
+		green  = { C.green,  C.greenLight,  C.greenShade },
+		red    = { C.red,    C.redLight,    C.redShade },
+		blue   = { C.blue,   C.blueLight,   C.blueShade },
+		purple = { C.purple, C.purpleLight, C.purpleShade },
+		off    = { C.off,    C.offLight,    C.offShade },
+	}
+
+	-- Colore della scritta sopra uno stile (sull'oro ci va scuro)
+	function Pix.textOn(style)
+		return style == "gold" and C.goldText or C.text
+	end
+
+	local function make(class, props, parent)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do o[k] = v end
+		if parent then o.Parent = parent end
+		return o
+	end
+	Pix.make = make
+
+	function Pix.tw(obj, time, props, style, dir)
+		local t = TweenService:Create(obj, TweenInfo.new(time,
+			style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+		t:Play()
+		return t
+	end
+
+	local function resolve(style)
+		if type(style) == "string" then style = Pix.STYLE[style] end
+		return style or Pix.STYLE.panel
+	end
+
+	-- Strato dove gli offset valgono "pixel a 1080p": un Frame grande 1/k
+	-- dello schermo con uno UIScale k sopra. Le misure in scale non cambiano.
+	function Pix.canvas(parent, z)
+		local root = make("Frame", {
+			Name = "PixCanvas", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = z or 1,
+		}, parent)
+		local scaler = make("UIScale", { Scale = 1 }, root)
+		local camConn
+		local function fit()
+			local cam = workspace.CurrentCamera
+			local h = cam and cam.ViewportSize.Y or 1080
+			local k = math.clamp(h / 1080, 0.4, 2.5)
+			scaler.Scale = k
+			root.Size = UDim2.fromScale(1 / k, 1 / k)
+		end
+		local function watch()
+			if camConn then camConn:Disconnect() end
+			local cam = workspace.CurrentCamera
+			if cam then camConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(fit) end
+			fit()
+		end
+		workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watch)
+		watch()
+		return root
+	end
+
+	-- Due rettangoli incrociati = un rettangolo con gli angoli "mangiati"
+	function Pix.notch(parent, pos, size, color, z)
+		local P = Pix.P
+		local holder = make("Frame", {
+			Position = pos or UDim2.new(), Size = size or UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1, ZIndex = z or 1,
+		}, parent)
+		make("Frame", {
+			Position = UDim2.fromOffset(P, 0), Size = UDim2.new(1, -2 * P, 1, 0),
+			BackgroundColor3 = color, BorderSizePixel = 0,
+		}, holder)
+		make("Frame", {
+			Position = UDim2.fromOffset(0, P), Size = UDim2.new(1, 0, 1, -2 * P),
+			BackgroundColor3 = color, BorderSizePixel = 0,
+		}, holder)
+		return holder
+	end
+
+	function Pix.notchColor(holder, color)
+		for _, f in ipairs(holder:GetChildren()) do
+			if f:IsA("Frame") then f.BackgroundColor3 = color end
+		end
+	end
+
+	-- Riquadro: bordo scuro smussato, riempimento, luce e ombra.
+	-- Ritorna { box, edge, inner, content, lights, shades }: le cose vanno in
+	-- .content (gia' rientrato dal bordo, ZIndex sopra al riempimento).
+	function Pix.box(parent, pos, size, style, z, anchor)
+		local P = Pix.P
+		local box = make("Frame", {
+			Position = pos or UDim2.new(), Size = size or UDim2.fromScale(1, 1),
+			AnchorPoint = anchor or Vector2.zero, BackgroundTransparency = 1, ZIndex = z or 1,
+		}, parent)
+		local edge = Pix.notch(box, UDim2.new(), UDim2.fromScale(1, 1), C.ink, 1)
+		local inner = make("Frame", {
+			Position = UDim2.fromOffset(P, P), Size = UDim2.new(1, -2 * P, 1, -2 * P),
+			BorderSizePixel = 0, ZIndex = 2,
+		}, box)
+		local pb = { box = box, edge = edge, inner = inner, lights = {}, shades = {} }
+		pb.lights[1] = make("Frame", { Size = UDim2.new(1, -P, 0, P), BorderSizePixel = 0 }, inner)
+		pb.lights[2] = make("Frame", { Size = UDim2.new(0, P, 1, -P), BorderSizePixel = 0 }, inner)
+		pb.shades[1] = make("Frame", {
+			Position = UDim2.new(0, P, 1, -P), Size = UDim2.new(1, -P, 0, P), BorderSizePixel = 0,
+		}, inner)
+		pb.shades[2] = make("Frame", {
+			Position = UDim2.new(1, -P, 0, P), Size = UDim2.new(0, P, 1, -P), BorderSizePixel = 0,
+		}, inner)
+		pb.content = make("Frame", {
+			Position = UDim2.fromOffset(2 * P, 2 * P), Size = UDim2.new(1, -4 * P, 1, -4 * P),
+			BackgroundTransparency = 1, ZIndex = 3,
+		}, box)
+		Pix.paint(pb, style)
+		return pb
+	end
+
+	function Pix.paint(pb, style)
+		local s = resolve(style)
+		pb.inner.BackgroundColor3 = s[1]
+		for _, f in ipairs(pb.lights) do
+			f.Visible = s[2] ~= nil
+			if s[2] then f.BackgroundColor3 = s[2] end
+		end
+		for _, f in ipairs(pb.shades) do
+			f.Visible = s[3] ~= nil
+			if s[3] then f.BackgroundColor3 = s[3] end
+		end
+	end
+
+	-- Riquadro schiacciato (luce e ombra scambiate): per il clic
+	function Pix.press(pb, style, down)
+		local s = resolve(style)
+		if down then
+			Pix.paint(pb, { s[1], s[3], s[2] })
+		else
+			Pix.paint(pb, s)
+		end
+	end
+
+	-- Testo con l'ombra a pixel. L'ombra copia da sola Text,
+	-- MaxVisibleGraphemes e TextTransparency della scritta: basta usare .main
+	-- come un TextLabel normale (anche per l'effetto macchina da scrivere).
+	-- opts: text, color, shadowColor, shadow (false = niente ombra), font,
+	--       alignX, alignY, wrap, max, min, z, anchor, rotation
+	function Pix.text(parent, pos, size, opts)
+		opts = opts or {}
+		local holder = make("Frame", {
+			Position = pos or UDim2.new(), Size = size or UDim2.fromScale(1, 1),
+			AnchorPoint = opts.anchor or Vector2.zero, BackgroundTransparency = 1, ZIndex = opts.z or 3,
+		}, parent)
+		local function lbl(color, z)
+			local l = make("TextLabel", {
+				Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = opts.text or "",
+				Font = opts.font or Pix.FONT, TextScaled = true, TextWrapped = opts.wrap or false,
+				TextXAlignment = opts.alignX or Enum.TextXAlignment.Center,
+				TextYAlignment = opts.alignY or Enum.TextYAlignment.Center,
+				TextColor3 = color, ZIndex = z, Rotation = opts.rotation or 0,
+			}, holder)
+			if opts.max or opts.min then
+				make("UITextSizeConstraint", { MaxTextSize = opts.max or 100, MinTextSize = opts.min or 1 }, l)
+			end
+			return l
+		end
+		local t = { holder = holder }
+		t.main = lbl(opts.color or C.text, 2)
+		if opts.shadow ~= false then
+			local sh = lbl(opts.shadowColor or C.textShadow, 1)
+			sh.Position = UDim2.fromOffset(Pix.SHADOW, Pix.SHADOW)
+			t.shadow = sh
+			for _, prop in ipairs({ "Text", "MaxVisibleGraphemes", "TextTransparency" }) do
+				t.main:GetPropertyChangedSignal(prop):Connect(function()
+					sh[prop] = t.main[prop]
+				end)
+			end
+		end
+		return t
+	end
+
+	function Pix.setText(t, text)
+		t.main.Text = text
+	end
+
+	-- Freccetta a gradini. rotation: 0 = destra, 90 = giu', 180 = sinistra, 270 = su.
+	-- pos e' il centro. Ritorna l'holder (si puo' muovere/ruotare/nascondere).
+	function Pix.arrow(parent, pos, steps, color, z, rotation)
+		local P = Pix.P
+		local w, h = (steps + 1) * P, 2 * (steps + 1) * P
+		local holder = make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = pos or UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(w, h), BackgroundTransparency = 1, ZIndex = z or 1,
+			Rotation = rotation or 0,
+		}, parent)
+		local cy = h / 2
+		-- Ogni colonna sborda di un pixel su quella prima: niente fessure con lo UIScale
+		for j = 0, steps do
+			local hh = (steps + 1 - j) * P
+			make("Frame", {
+				Position = UDim2.fromOffset(j * P - (j > 0 and 1 or 0), cy - hh),
+				Size = UDim2.fromOffset(P + (j > 0 and 1 or 0), hh * 2),
+				BackgroundColor3 = C.ink, BorderSizePixel = 0,
+			}, holder)
+		end
+		for j = 0, steps - 1 do
+			local hh = (steps - j) * P
+			make("Frame", {
+				Position = UDim2.fromOffset(j * P - (j > 0 and 1 or 0), cy - hh),
+				Size = UDim2.fromOffset(P + (j > 0 and 1 or 0), hh * 2),
+				BackgroundColor3 = color or C.gold, BorderSizePixel = 0, ZIndex = 2,
+			}, holder)
+		end
+		return holder
+	end
+
+	function Pix.ballColors(top)
+		return ColorSequence.new({
+			ColorSequenceKeypoint.new(0, top),
+			ColorSequenceKeypoint.new(0.42, top),
+			ColorSequenceKeypoint.new(0.43, C.ink),
+			ColorSequenceKeypoint.new(0.57, C.ink),
+			ColorSequenceKeypoint.new(0.58, C.white),
+			ColorSequenceKeypoint.new(1, C.ballBottom),
+		})
+	end
+
+	-- La Ball, come quella delle schede della squadra. size: UDim2 (quadrato).
+	-- Ritorna ball, gradiente (per cambiare colore: grad.Color = Pix.ballColors(...))
+	function Pix.ball(parent, pos, size, z, top)
+		local P = Pix.P
+		local function round(o)
+			make("UICorner", { CornerRadius = UDim.new(0.5, 0) }, o)
+			return o
+		end
+		local ball = round(make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = pos, Size = size,
+			SizeConstraint = Enum.SizeConstraint.RelativeYY,
+			BackgroundColor3 = C.ink, BorderSizePixel = 0, ZIndex = z or 1,
+		}, parent))
+		local face = round(make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.new(1, -2 * P, 1, -2 * P), BackgroundColor3 = C.white, BorderSizePixel = 0,
+		}, ball))
+		local grad = make("UIGradient", { Rotation = 90, Color = Pix.ballColors(top or C.ballRed) }, face)
+		local button = round(make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.42, 0.42),
+			BackgroundColor3 = C.ink, BorderSizePixel = 0, ZIndex = 2,
+		}, ball))
+		round(make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.5, 0.5),
+			BackgroundColor3 = C.white, BorderSizePixel = 0,
+		}, button))
+		round(make("Frame", {
+			Position = UDim2.fromScale(0.24, 0.17), Size = UDim2.fromScale(0.2, 0.14),
+			BackgroundColor3 = C.white, BackgroundTransparency = 0.3, BorderSizePixel = 0, ZIndex = 2,
+		}, ball))
+		return ball, grad
+	end
+
+	-- Barra orizzontale (caricamento, esperienza...). bar.set(p, color, time)
+	function Pix.bar(parent, pos, size, color, z, anchor)
+		local pb = Pix.box(parent, pos, size, "track", z, anchor)
+		local fill = make("Frame", {
+			Size = UDim2.fromScale(0, 1), BackgroundColor3 = color or C.gold, BorderSizePixel = 0,
+		}, pb.inner)
+		make("Frame", {
+			Position = UDim2.fromScale(0, 0), Size = UDim2.new(1, 0, 0, Pix.P),
+			BackgroundColor3 = C.white, BackgroundTransparency = 0.55, BorderSizePixel = 0,
+		}, fill)
+		local bar = { pb = pb, fill = fill }
+		function bar.set(p, col, time)
+			p = math.clamp(p or 0, 0, 1)
+			local goal = { Size = UDim2.fromScale(p, 1) }
+			if col then goal.BackgroundColor3 = col end
+			if time and time > 0 then
+				Pix.tw(fill, time, goal)
+			else
+				for k, v in pairs(goal) do fill[k] = v end
+			end
+		end
+		return bar
+	end
+
+	-- Bottone: riquadro + scritta, bordino dorato quando e' "caldo" (mouse o
+	-- tastiera), si schiaccia al clic. opts: text, style, z, anchor, max,
+	-- textColor, font, manual (true = il bordino lo gestisci tu con setHot)
+	-- Ritorna { root, pb, label, hit, scale, glow, setHot, setStyle, setEnabled }
+	function Pix.button(parent, pos, size, opts)
+		opts = opts or {}
+		local P = Pix.P
+		local b = { style = opts.style or "panel", enabled = true, hot = false }
+		b.root = make("Frame", {
+			Position = pos or UDim2.new(), Size = size or UDim2.fromScale(1, 1),
+			AnchorPoint = opts.anchor or Vector2.zero, BackgroundTransparency = 1, ZIndex = opts.z or 1,
+		}, parent)
+		b.scale = make("UIScale", { Scale = 1 }, b.root)
+		b.glow = Pix.notch(b.root, UDim2.fromOffset(-P, -P), UDim2.new(1, 2 * P, 1, 2 * P), C.gold, 1)
+		b.glow.Visible = false
+		b.pb = Pix.box(b.root, UDim2.new(), UDim2.fromScale(1, 1), b.style, 2)
+		b.label = Pix.text(b.pb.content, UDim2.fromScale(0.5, 0.5), UDim2.fromScale(0.86, 0.7), {
+			text = opts.text or "", anchor = Vector2.new(0.5, 0.5), max = opts.max, font = opts.font,
+			color = opts.textColor or Pix.textOn(b.style),
+			shadowColor = b.style == "gold" and C.goldLight or nil,
+		})
+		b.hit = make("TextButton", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "",
+			AutoButtonColor = false, ZIndex = 10,
+		}, b.root)
+
+		function b.setHot(on)
+			on = on and b.enabled or false
+			if b.hot == on then return end
+			b.hot = on
+			b.glow.Visible = on
+			Pix.tw(b.scale, 0.2, { Scale = on and 1.05 or 1 }, Enum.EasingStyle.Back)
+		end
+		function b.setStyle(style)
+			b.style = style
+			Pix.paint(b.pb, b.enabled and style or "off")
+			b.label.main.TextColor3 = opts.textColor or Pix.textOn(b.enabled and style or "off")
+			if b.label.shadow then
+				b.label.shadow.TextColor3 = (b.enabled and style == "gold") and C.goldLight or C.textShadow
+			end
+		end
+		function b.setEnabled(on)
+			b.enabled = on
+			b.setStyle(b.style)
+			if not on then b.setHot(false) end
+		end
+
+		if not opts.manual then
+			b.hit.MouseEnter:Connect(function() b.setHot(true) end)
+			b.hit.MouseLeave:Connect(function() b.setHot(false) end)
+		end
+		b.hit.MouseButton1Down:Connect(function()
+			if not b.enabled then return end
+			Pix.press(b.pb, b.style, true)
+			Pix.tw(b.scale, 0.08, { Scale = 0.94 })
+		end)
+		local function release()
+			Pix.paint(b.pb, b.enabled and b.style or "off")
+			Pix.tw(b.scale, 0.2, { Scale = b.hot and 1.05 or 1 }, Enum.EasingStyle.Back)
+		end
+		b.hit.MouseButton1Up:Connect(release)
+		b.hit.MouseLeave:Connect(release)
+		return b
+	end
+
+	-- Finestra: riquadro con la fascia del titolo e, se opts.close, la X rossa.
+	-- opts: accent (stile della fascia, default "slot"), band (altezza in scale,
+	--       default 0.16), close (true), z, anchor
+	-- Ritorna { root, pop (UIScale), pb, band, title, close, content }
+	function Pix.window(parent, pos, size, title, opts)
+		opts = opts or {}
+		local P = Pix.P
+		local w = {}
+		w.root = make("Frame", {
+			Position = pos or UDim2.new(), Size = size or UDim2.fromScale(1, 1),
+			AnchorPoint = opts.anchor or Vector2.zero, BackgroundTransparency = 1, ZIndex = opts.z or 1,
+		}, parent)
+		w.pop = make("UIScale", { Scale = 1 }, w.root)
+		w.pb = Pix.box(w.root, UDim2.new(), UDim2.fromScale(1, 1), "panel", 1)
+		local bandH = opts.band or 0.16
+		w.band = Pix.box(w.pb.content, UDim2.new(), UDim2.fromScale(1, bandH), opts.accent or "slot", 1)
+		w.title = Pix.text(w.band.content, UDim2.fromScale(0.03, 0.1), UDim2.fromScale(0.75, 0.8), {
+			text = title or "", alignX = Enum.TextXAlignment.Left,
+			color = Pix.textOn(opts.accent or "slot"),
+			shadowColor = (opts.accent == "gold") and C.goldLight or nil,
+		})
+		if opts.close then
+			w.close = Pix.button(w.band.content, UDim2.fromScale(1, 0.5), UDim2.fromScale(0.9, 0.9), {
+				text = "X", style = "red", anchor = Vector2.new(1, 0.5), z = 5,
+			})
+			w.close.root.SizeConstraint = Enum.SizeConstraint.RelativeYY
+		end
+		w.content = make("Frame", {
+			Position = UDim2.new(0, 0, bandH, 2 * P), Size = UDim2.new(1, 0, 1 - bandH, -2 * P),
+			BackgroundTransparency = 1, ZIndex = 2,
+		}, w.pb.content)
+		return w
+	end
+end
+
 -- ============================================================================
 -- STATO
 -- ============================================================================
@@ -59,7 +512,8 @@ local current = {
 	obj    = nil,
 }
 
-local screenGui, edgeArrow, edgeLabel, objTitle, objHint
+local screenGui, edgeArrow, edgePulse, edgeLabel, objCard, objTitle, objHint
+local hasObjective = false
 
 -- ============================================================================
 -- RICERCA BERSAGLIO
@@ -268,31 +722,46 @@ local function buildMarker(target, label)
 	bb.Size        = UDim2.fromScale(9, 3.4)
 	bb.AlwaysOnTop = true
 	bb.MaxDistance = 500
+	bb.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	bb.Parent      = signAnchor
 	table.insert(current.fx, bb)
 
-	local signTitle = Instance.new("TextLabel")
-	signTitle.Size                   = UDim2.fromScale(1, 0.55)
-	signTitle.BackgroundTransparency = 1
-	signTitle.Font                   = Enum.Font.FredokaOne
-	signTitle.Text                   = label
-	signTitle.TextColor3             = COLOR
-	signTitle.TextStrokeColor3       = Color3.fromRGB(40, 28, 0)
-	signTitle.TextStrokeTransparency = 0
-	signTitle.TextScaled             = true
-	signTitle.Parent                 = bb
+	-- Il cartello e' disegnato a misura fissa e scalato come uno sprite:
+	-- cosi' bordi e ombre restano in proporzione a ogni distanza
+	local fitArea = Pix.make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 }, bb)
+	local sign = Pix.make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(SIGN_W, SIGN_H), BackgroundTransparency = 1,
+	}, fitArea)
+	local signScale = Pix.make("UIScale", { Scale = 1 }, sign)
+	local function fitSign()
+		-- Prima del primo disegno il billboard misura 0: non azzerare la scala
+		local h = fitArea.AbsoluteSize.Y
+		if h > 0 then signScale.Scale = h / SIGN_H end
+	end
+	fitArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitSign)
+	fitSign()
 
-	local distText = signTitle:Clone()
-	distText.Size       = UDim2.fromScale(1, 0.34)
-	distText.Position   = UDim2.fromScale(0, 0.6)
-	distText.Font       = Enum.Font.GothamBold
-	distText.TextColor3 = Color3.new(1, 1, 1)
-	distText.Text       = ""
-	distText.Parent     = bb
+	-- Riquadro largo quanto serve al nome (Arcade e' a larghezza fissa,
+	-- "Exit" non deve stare in un cartello enorme); i nomi lunghi vanno a capo:
+	-- su una riga sola "... — Entrance" diventerebbe minuscolo
+	local function textW(s, px)
+		return TextService:GetTextSize(s, px, Pix.FONT, Vector2.new(4096, 4096)).X
+	end
+	local panelW = math.min(math.max(textW(label, 30), textW("9999 studs", 20)) + 28, SIGN_W)
+	local panel = Pix.box(sign, UDim2.new(0.5, 0, 0.5, -6), UDim2.fromOffset(panelW, 70), "panel", 2, Vector2.new(0.5, 0.5))
+	Pix.text(panel.content, UDim2.fromOffset(4, 2), UDim2.new(1, -8, 0, 30), {
+		text = label, color = Pix.C.gold, wrap = true,
+	})
+	local distText = Pix.text(panel.content, UDim2.fromOffset(4, 36), UDim2.new(1, -8, 0, 20), {
+		color = Pix.C.text,
+	})
+	-- Freccetta sotto il riquadro che punta giu' al bersaglio
+	Pix.arrow(sign, UDim2.new(0.5, 0, 0.5, 35), 3, Pix.C.gold, 1, 90)
 
 	current.sign      = signAnchor
 	current.signCF    = signAnchor.CFrame
-	current.distLabel = distText
+	current.distLabel = distText.main
 	current.bigArrow, current.signArrow = nil, nil
 	current.beam, current.core, current.disc, current.ring = nil, nil, nil, nil
 end
@@ -307,54 +776,58 @@ local function buildScreenGui()
 	screenGui.ResetOnSpawn   = false
 	screenGui.IgnoreGuiInset = true
 	screenGui.DisplayOrder   = 15
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	screenGui.Parent         = player:WaitForChild("PlayerGui")
 
-	edgeArrow = Instance.new("TextLabel")
-	edgeArrow.Size                   = UDim2.fromScale(0.05, 0.09)
-	edgeArrow.AnchorPoint            = Vector2.new(0.5, 0.5)
-	edgeArrow.BackgroundTransparency = 1
-	edgeArrow.Font                   = Enum.Font.FredokaOne
-	edgeArrow.Text                   = "➤"
-	edgeArrow.TextColor3             = COLOR
-	edgeArrow.TextStrokeColor3       = Color3.fromRGB(40, 28, 0)
-	edgeArrow.TextStrokeTransparency = 0.2
-	edgeArrow.TextScaled             = true
-	edgeArrow.Visible                = false
-	edgeArrow.Parent                 = screenGui
+	local canvas = Pix.canvas(screenGui)
 
-	edgeLabel = Instance.new("TextLabel")
-	edgeLabel.Size                   = UDim2.fromScale(0.16, 0.028)
-	edgeLabel.AnchorPoint            = Vector2.new(0.5, 0.5)
-	edgeLabel.BackgroundTransparency = 1
-	edgeLabel.Font                   = Enum.Font.GothamBold
-	edgeLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
-	edgeLabel.TextStrokeTransparency = 0.4
-	edgeLabel.TextScaled             = true
-	edgeLabel.Visible                = false
-	edgeLabel.Parent                 = screenGui
+	-- Freccetta pixel dentro un holder che si posiziona e ruota come prima
+	-- (0 = verso destra); lo UIScale la fa pulsare
+	edgeArrow = Pix.make("Frame", {
+		Name = "EdgeArrow", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(60, 60),
+		BackgroundTransparency = 1, Visible = false,
+	}, canvas)
+	edgePulse = Pix.make("UIScale", { Scale = 1 }, edgeArrow)
+	Pix.arrow(edgeArrow, UDim2.fromScale(0.5, 0.5), 8, Pix.C.gold, 1)
 
-	objTitle = Instance.new("TextLabel")
-	objTitle.Name                   = "ObjectiveTitle"
-	objTitle.Position               = OBJ_POS
-	objTitle.Size                   = UDim2.fromOffset(340, 26)
-	objTitle.BackgroundTransparency = 1
-	objTitle.Font                   = Enum.Font.FredokaOne
-	objTitle.TextXAlignment         = Enum.TextXAlignment.Left
-	objTitle.TextColor3             = COLOR
-	objTitle.TextStrokeColor3       = Color3.fromRGB(40, 28, 0)
-	objTitle.TextStrokeTransparency = 0
-	objTitle.TextScaled             = true
-	objTitle.Text                   = ""
-	objTitle.Parent                 = screenGui
+	edgeLabel = Pix.text(canvas, UDim2.new(), UDim2.fromScale(0.16, 0.028), {
+		anchor = Vector2.new(0.5, 0.5), color = Pix.C.text,
+	}).holder
+	edgeLabel.Visible = false
 
-	objHint = objTitle:Clone()
-	objHint.Name             = "ObjectiveHint"
-	objHint.Position         = OBJ_POS + UDim2.fromOffset(0, 28)
-	objHint.Size             = UDim2.fromOffset(340, 20)
-	objHint.Font             = Enum.Font.GothamBold
-	objHint.TextColor3       = Color3.new(1, 1, 1)
-	objHint.TextStrokeColor3 = Color3.fromRGB(15, 15, 25)
-	objHint.Parent           = screenGui
+	-- La barra in alto di Roblox non scala con lo schermo: la scheda resta
+	-- sempre OBJ_POS.Y pixel veri sotto il bordo (come prima), in una fascia
+	-- col suo canvas
+	local objArea = Pix.make("Frame", {
+		Position = UDim2.fromOffset(0, OBJ_POS.Y.Offset), Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1, ZIndex = 2,
+	}, screenGui)
+
+	-- Scheda dell'obiettivo. CanvasGroup: e' fatta di tanti Frame e deve
+	-- entrare e sfumare tutta insieme
+	objCard = Pix.make("CanvasGroup", {
+		Name = "Objective", Position = UDim2.fromOffset(OBJ_POS.X.Offset, 0),
+		Size = UDim2.fromOffset(CARD_W, CARD_H), BackgroundTransparency = 1, Visible = false,
+	}, Pix.canvas(objArea))
+	local card = Pix.box(objCard, UDim2.new(), UDim2.fromScale(1, 1), "panel")
+
+	-- Rombo d'oro (due freccette schiena contro schiena, sovrapposte di un
+	-- pixel per non lasciare fessure) nel riquadro incavato, come la gemma
+	-- dello strumento nella squadra
+	local well = Pix.box(card.content, UDim2.fromScale(0, 0.5), UDim2.fromOffset(44, 44), "slot", 1, Vector2.new(0, 0.5))
+	Pix.arrow(well.content, UDim2.new(0.5, -7, 0.5, 0), 4, Pix.C.gold, 1, 180)
+	Pix.arrow(well.content, UDim2.new(0.5, 7, 0.5, 0), 4, Pix.C.gold, 1, 0)
+
+	objTitle = Pix.text(card.content, UDim2.fromOffset(54, 2), UDim2.new(1, -58, 0, 20), {
+		color = Pix.C.gold, alignX = Enum.TextXAlignment.Left,
+	})
+	objTitle.holder.Name = "ObjectiveTitle"
+
+	objHint = Pix.text(card.content, UDim2.fromOffset(54, 26), UDim2.new(1, -58, 0, 32), {
+		color = Pix.C.text, alignX = Enum.TextXAlignment.Left, alignY = Enum.TextYAlignment.Top,
+		wrap = true, max = 14,
+	})
+	objHint.holder.Name = "ObjectiveHint"
 end
 
 -- ============================================================================
@@ -371,9 +844,8 @@ end
 local t0 = os.clock()
 
 RunService.RenderStepped:Connect(function()
-	if objTitle then
-		local vis = not hidden()
-		objTitle.Visible, objHint.Visible = vis, vis
+	if objCard then
+		objCard.Visible = hasObjective and not hidden()
 	end
 
 	if not current.target or not current.target.Parent then
@@ -478,6 +950,7 @@ RunService.RenderStepped:Connect(function()
 	edgeArrow.Visible  = true
 	edgeArrow.Position = UDim2.fromScale(pos.X, pos.Y)
 	edgeArrow.Rotation = math.deg(math.atan2(dir.Y, dir.X))
+	edgePulse.Scale    = 1 + math.sin(t * 5) * 0.08
 
 	edgeLabel.Visible = false
 end)
@@ -490,19 +963,20 @@ local shownStage = nil
 
 local function showObjective(objective, stage)
 	if not objTitle then return end
-	objTitle.Text = objective and ("★ " .. string.upper(objective.label or objective.target)) or ""
-	objHint.Text  = objective and (objective.hint or "") or ""
+	-- Senza obiettivo la scheda si nasconde
+	hasObjective = objective ~= nil
+	objTitle.main.Text = objective and string.upper(objective.label or objective.target) or ""
+	objHint.main.Text  = objective and (objective.hint or "") or ""
 
 	if shownStage == stage then return end
 	shownStage = stage
 
-	for i, l in ipairs({ objTitle, objHint }) do
-		local goal = OBJ_POS + UDim2.fromOffset(0, (i - 1) * 28)
-		l.Position = goal - UDim2.fromOffset(40, 0)
-		l.TextTransparency, l.TextStrokeTransparency = 1, 1
-		TweenService:Create(l, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-			{ Position = goal, TextTransparency = 0, TextStrokeTransparency = 0 }):Play()
-	end
+	-- La scheda intera entra da sinistra e compare
+	local goal = UDim2.fromOffset(OBJ_POS.X.Offset, 0)
+	objCard.Position = goal - UDim2.fromOffset(40, 0)
+	objCard.GroupTransparency = 1
+	Pix.tw(objCard, 0.5, { Position = goal }, Enum.EasingStyle.Back)
+	Pix.tw(objCard, 0.35, { GroupTransparency = 0 })
 end
 
 local searching = false
